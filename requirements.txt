@@ -1,0 +1,25 @@
+# Kafka and messaging
+kafka-python==2.0.2
+
+# Database and caching
+neo4j==5.9.0
+redis==4.5.4
+
+# NLP and analysis
+spacy==3.5.3
+textblob==0.17.1
+rdflib==6.3.2
+
+# Data processing and utilities
+networkx==3.1
+numpy==1.23.5
+python-dotenv==1.0.0
+
+# Datetime handling
+python-dateutil==2.8.2
+
+# Logging and monitoring
+structlog==23.1.0
+
+# JSON handling
+ujson==5.7.0
