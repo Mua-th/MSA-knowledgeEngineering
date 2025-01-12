@@ -1,16 +1,29 @@
-FROM python:3.9-slim
+FROM python:3.9-slim AS base
 
+# Consumer Service
+FROM base AS consumer
 WORKDIR /app
 
-# Copy only the requirements file to leverage Docker cache
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install requirements
 COPY requirements.txt .
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m spacy download en_core_web_sm
 
-# Copy the rest of the application code
+# Download NLTK data and TextBlob corpora
+RUN python -c "import nltk; \
+    nltk.download('punkt'); \
+    nltk.download('averaged_perceptron_tagger'); \
+    nltk.download('wordnet'); \
+    nltk.download('brown'); \
+    nltk.download('movie_reviews')" && \
+    python -m textblob.download_corpora light && \
+    python -m spacy download en_core_web_sm
+
+# Copy application code
 COPY . .
-
-# Set the entry point for the container
 CMD ["python", "main.py"]
