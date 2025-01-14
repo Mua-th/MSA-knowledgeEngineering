@@ -174,7 +174,7 @@ class KafkaConnection:
 
 # Kafka connection setup
 bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")  # Changed default to kafka:29092
-topic = "text_data"
+topic = "textdata"
 group_id = 'my-group'
 
 kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)

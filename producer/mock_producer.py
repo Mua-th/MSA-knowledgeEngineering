@@ -49,7 +49,7 @@ def main():
     producer = create_producer()
     
     print("Enter messages to send to Kafka. Type 'exit' to quit.")
-    topic = os.getenv("KAFKA_TOPIC", "text_data")
+    topic = os.getenv("KAFKA_TOPIC", "textdata")
     
     try:
         while True:
