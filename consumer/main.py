@@ -7,7 +7,7 @@ from kafka import KafkaConsumer
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 import spacy
-from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import json
 from collections import defaultdict
 import redis
@@ -48,6 +48,7 @@ class MessageBatch:
 class TextAnalyzer:
     def __init__(self):
         self.nlp = spacy.load("en_core_web_sm")
+        self.analyzer = SentimentIntensityAnalyzer()
         self.cache = redis.Redis(host='redis', port=6379, db=0)
 
     @lru_cache(maxsize=1000)
@@ -59,14 +60,14 @@ class TextAnalyzer:
             return json.loads(cached_result)
 
         doc = self.nlp(text)
-        blob = TextBlob(text)
+        sentiment = self.analyzer.polarity_scores(text)
 
         analysis = {
             'keywords': [token.lemma_ for token in doc if token.is_alpha and not token.is_stop],
             'entities': [(ent.text, ent.label_) for ent in doc.ents],
             'sentiment': {
-                'polarity': blob.sentiment.polarity,
-                'subjectivity': blob.sentiment.subjectivity
+                'polarity': sentiment['compound'],
+                'subjectivity': sentiment['neu']  # VADER does not provide subjectivity, using neutrality as a placeholder
             },
             'summary': ' '.join([sent.text for sent in doc.sents][:2]),
             'word_count': len([token for token in doc if token.is_alpha]),
@@ -179,21 +180,9 @@ group_id = 'my-group'
 
 kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)
 
-# def create_semantic_network(document_id, keywords):
-#     # Create nodes for each keyword
-#     for keyword in keywords:
-#         conn.query("MERGE (k:Keyword {word: $word})", parameters={"word": keyword})
-
-#     # Create relationships between keywords
-#     for i in range(len(keywords)):
-#         for j in range(i + 1, len(keywords)):
-#             conn.query("""
-#             MATCH (k1:Keyword {word: $word1}), (k2:Keyword {word: $word2})
-#             MERGE (k1)-[:CO_OCCURS_WITH]->(k2)
-#             """, parameters={"word1": keywords[i], "word2": keywords[j]})
-
 def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAnalyzer, rule_engine: MarketRuleEngine, ontology: MarketOntology):
     if not batch.messages:
+        logger.info("No messages to process in batch")
         return
 
     logger.info(f"Processing batch of {len(batch.messages)} messages")
@@ -220,14 +209,14 @@ def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAn
                     'sentiment': analysis.get('overall_sentiment', 0),
                     'word_count': len(text.split())
                 },
-                'keywords': analysis.get('sectors', {}).keys()  # Use sectors as keywords
+                'keywords': list(analysis.get('sectors', {}).keys())  # Convert dict_keys to list
             })
 
             analysis_results.append({
                 'id': doc_id,
                 'sentiment': analysis['overall_sentiment'],
-                'entity_count': len(analysis['entities']),
-                'processed_at': analysis['processed_at']
+                'entity_count': len(analysis.get('entities', [])),  # Add default empty list
+                'processed_at': datetime.now().isoformat()  # Add processed_at if missing
             })
 
             # Process analysis results with rules
@@ -246,14 +235,14 @@ def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAn
             continue
 
     try:
-        conn.batch_create_nodes(batch_data)
-        conn.create_semantic_relationships(analysis_results)
-        logger.info(f"Successfully processed batch of {len(batch_data)} messages")
+        if batch_data:  # Only attempt to create nodes if we have data
+            conn.batch_create_nodes(batch_data)
+            conn.create_semantic_relationships(analysis_results)
+            logger.info(f"Successfully processed batch of {len(batch_data)} messages")
     except Exception as e:
         logger.error(f"Error writing to Neo4j: {e}")
 
     batch.clear()
-
 def main():
     logger.setLevel(logging.INFO)  # Set to DEBUG for more detailed logs
     analyzer = MarketAnalyzer()

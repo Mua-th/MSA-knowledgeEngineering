@@ -1,11 +1,12 @@
 from typing import Dict, List
 import spacy
-from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from collections import defaultdict
 
 class MarketAnalyzer:
     def __init__(self):
         self.nlp = spacy.load("en_core_web_sm")
+        self.analyzer = SentimentIntensityAnalyzer()
         self.market_sectors = self._load_market_sectors()
         self.product_terms = self._load_product_terms()
 
@@ -26,7 +27,7 @@ class MarketAnalyzer:
 
     def analyze_market_context(self, text: str) -> Dict:
         doc = self.nlp(text)
-        blob = TextBlob(text)
+        sentiment = self.analyzer.polarity_scores(text)
 
         # Market sector analysis
         sectors = defaultdict(int)
@@ -37,16 +38,16 @@ class MarketAnalyzer:
 
         # Product aspect analysis
         aspects = defaultdict(lambda: {"count": 0, "sentiment": 0})
-        for sentence in blob.sentences:
+        for sentence in doc.sents:
             for aspect, terms in self.product_terms.items():
-                if any(term in sentence.string.lower() for term in terms):
+                if any(term in sentence.text.lower() for term in terms):
                     aspects[aspect]["count"] += 1
-                    aspects[aspect]["sentiment"] += sentence.sentiment.polarity
+                    aspects[aspect]["sentiment"] += self.analyzer.polarity_scores(sentence.text)['compound']
 
         return {
             "sectors": dict(sectors),
             "aspects": {k: dict(v) for k, v in aspects.items()},
-            "overall_sentiment": blob.sentiment.polarity,
+            "overall_sentiment": sentiment['compound'],
             "market_confidence": self._calculate_market_confidence(doc)
         }
 

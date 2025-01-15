@@ -7,7 +7,7 @@ redis==4.5.4
 
 # NLP and analysis
 spacy==3.5.3
-textblob==0.17.1
+vaderSentiment==3.3.2
 rdflib==6.3.2
 
 # Data processing and utilities
@@ -23,3 +23,5 @@ structlog==23.1.0
 
 # JSON handling
 ujson==5.7.0
+
+nltk==3.8.1

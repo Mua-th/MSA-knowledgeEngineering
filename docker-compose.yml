@@ -110,7 +110,7 @@ services:
 
   consumer:
     build:
-      context: .
+      context: ./consumer
       dockerfile: Dockerfile
     env_file:
       - .env
