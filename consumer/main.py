@@ -45,38 +45,6 @@ class MessageBatch:
         self.messages = []
         self.last_process_time = time.time()
 
-class TextAnalyzer:
-    def __init__(self):
-        self.nlp = spacy.load("en_core_web_sm")
-        self.analyzer = SentimentIntensityAnalyzer()
-        self.cache = redis.Redis(host='redis', port=6379, db=0)
-
-    @lru_cache(maxsize=1000)
-    def analyze_text(self, text: str) -> Dict:
-        # Check cache first
-        cache_key = f"text_analysis_{hash(text)}"
-        cached_result = self.cache.get(cache_key)
-        if cached_result:
-            return json.loads(cached_result)
-
-        doc = self.nlp(text)
-        sentiment = self.analyzer.polarity_scores(text)
-
-        analysis = {
-            'keywords': [token.lemma_ for token in doc if token.is_alpha and not token.is_stop],
-            'entities': [(ent.text, ent.label_) for ent in doc.ents],
-            'sentiment': {
-                'polarity': sentiment['compound'],
-                'subjectivity': sentiment['neu']  # VADER does not provide subjectivity, using neutrality as a placeholder
-            },
-            'summary': ' '.join([sent.text for sent in doc.sents][:2]),
-            'word_count': len([token for token in doc if token.is_alpha]),
-            'processed_at': datetime.now().isoformat()
-        }
-
-        # Cache the result
-        self.cache.setex(cache_key, 3600, json.dumps(analysis))  # Cache for 1 hour
-        return analysis
 
 class Neo4jConnection:
     def __init__(self, uri, user, password, database="neo4j"):
@@ -194,56 +162,75 @@ def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAn
             text = message.value.decode('utf-8')
             doc_id = message.key.decode('utf-8') if message.key else str(message.offset)
             
-            logger.info(f"Processing message {doc_id}: {text[:100]}...")
+            logger.debug(f"Processing message {doc_id}: {text[:100]}...")
             
-            # Perform text analysis
+            # Analyze text with validation
             analysis = analyzer.analyze_market_context(text)
+            if not analysis:
+                logger.error(f"Empty analysis result for message {doc_id}")
+                continue
+
+            # Validate required fields
+            required_fields = ['overall_sentiment', 'market_confidence', 'keywords', 'sectors']
+            if not all(field in analysis for field in required_fields):
+                logger.error(f"Missing required fields in analysis: {[f for f in required_fields if f not in analysis]}")
+                continue
             
-            logger.debug(f"Analysis result for {doc_id}: {json.dumps(analysis, indent=2)}")
-            
+            # Store in Neo4j with safe access
             batch_data.append({
                 'id': doc_id,
                 'properties': {
                     'text': text,
                     'created_at': datetime.now().isoformat(),
                     'sentiment': analysis.get('overall_sentiment', 0),
-                    'word_count': len(text.split())
+                    'market_confidence': analysis.get('market_confidence', 0),
+                    'word_count': len(analysis.get('keywords', []))
                 },
-                'keywords': list(analysis.get('sectors', {}).keys())  # Convert dict_keys to list
+                'keywords': list(analysis.get('sectors', {}).keys())
             })
 
-            analysis_results.append({
-                'id': doc_id,
-                'sentiment': analysis['overall_sentiment'],
-                'entity_count': len(analysis.get('entities', [])),  # Add default empty list
-                'processed_at': datetime.now().isoformat()  # Add processed_at if missing
-            })
+            # Process rules with validation
+            try:
+                recommendations = rule_engine.process_analysis(analysis)
+            except Exception as e:
+                logger.error(f"Error processing rules: {e}")
+                recommendations = []
 
-            # Process analysis results with rules
-            recommendations = rule_engine.process_analysis(analysis)
-            for recommendation in recommendations:
-                ontology.add_market_knowledge(
-                    subject_type="Event",
-                    subject_name=f"MarketAnalysis_{doc_id}",
-                    predicate="hasRecommendation",
-                    object_type="Recommendation",
-                    object_name=recommendation["action"]
-                )
-                
-            json_data = ontology.export_knowledge()
-            print(json_data)
+            # Update ontology with confidence threshold
+            for sector, data in analysis.get('sectors', {}).items():
+                if data.get('confidence', 0) > 0.3:
+                    try:
+                        ontology.add_market_knowledge(
+                            "Event", f"Analysis_{doc_id}",
+                            "relatesToSector",
+                            "Sector", sector
+                        )
+                    except Exception as e:
+                        logger.error(f"Error adding sector knowledge: {e}")
+
+            for rec in recommendations:
+                try:
+                    ontology.add_market_knowledge(
+                        "Event", f"Analysis_{doc_id}",
+                        "hasRecommendation",
+                        "Action", rec.get('action', 'unknown')
+                    )
+                except Exception as e:
+                    logger.error(f"Error adding recommendation: {e}")
 
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message {doc_id}: {e}", exc_info=True)
             continue
 
+    # Batch persist with transaction
     try:
-        if batch_data:  # Only attempt to create nodes if we have data
+        if batch_data:
+            logger.info(f"Persisting {len(batch_data)} records")
             conn.batch_create_nodes(batch_data)
-            conn.create_semantic_relationships(analysis_results)
-            logger.info(f"Successfully processed batch of {len(batch_data)} messages")
+            ontology.save_to_neo4j()
+            logger.info("Batch successfully persisted")
     except Exception as e:
-        logger.error(f"Error writing to Neo4j: {e}")
+        logger.error(f"Error persisting batch: {e}", exc_info=True)
 
     batch.clear()
 def main():
@@ -251,7 +238,7 @@ def main():
     analyzer = MarketAnalyzer()
     rule_engine = MarketRuleEngine()
     ontology = MarketOntology()
-    batch = MessageBatch(max_size=1)  # Process one message at a time for testing
+    batch = MessageBatch(max_size=3)  # Process one message at a time for testing
     
     kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)
     
