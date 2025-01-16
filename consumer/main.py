@@ -229,6 +229,9 @@ def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAn
                     object_type="Recommendation",
                     object_name=recommendation["action"]
                 )
+                
+            json_data = ontology.export_knowledge()
+            print(json_data)
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")

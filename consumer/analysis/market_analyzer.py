@@ -15,7 +15,9 @@ class MarketAnalyzer:
         return {
             "tech": ["software", "hardware", "AI", "cloud"],
             "retail": ["store", "shop", "sales", "consumer"],
-            "finance": ["bank", "investment", "trading", "market"]
+            "finance": ["bank", "investment", "trading", "market"],
+             "health": ["health", "medical", "pharmaceutical", "biotech"],
+
         }
 
     def _load_product_terms(self) -> Dict[str, List[str]]:
