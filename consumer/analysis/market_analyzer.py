@@ -9,6 +9,7 @@ class MarketAnalyzer:
         self.analyzer = SentimentIntensityAnalyzer()
         self.market_sectors = self._load_market_sectors()
         self.product_terms = self._load_product_terms()
+        
 
     def _load_market_sectors(self) -> Dict[str, List[str]]:
         # This would typically load from a configuration file
@@ -16,7 +17,7 @@ class MarketAnalyzer:
             "tech": ["software", "hardware", "AI", "cloud"],
             "retail": ["store", "shop", "sales", "consumer"],
             "finance": ["bank", "investment", "trading", "market"],
-             "health": ["health", "medical", "pharmaceutical", "biotech"],
+            "health": ["health", "medical", "pharmaceutical", "biotech"],
 
         }
 
