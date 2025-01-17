@@ -78,28 +78,84 @@ class Neo4jConnection:
             return [record for record in result]
 
     def batch_create_nodes(self, batch_data: List[Dict]):
-        query = """
-        UNWIND $batch AS item
-        MERGE (d:Document {id: item.id})
-        SET d += item.properties
-        WITH d, item
-        UNWIND item.keywords AS keyword
-        MERGE (k:Keyword {word: keyword})
-        MERGE (d)-[:CONTAINS]->(k)
-        """
-        logger.info(f"Executing batch create with {len(batch_data)} items")
-        logger.debug(f"Batch data: {json.dumps(batch_data, indent=2)}")
-        return self.query(query, parameters={'batch': batch_data})
+        queries = [
+            # Create Document nodes
+            """
+            UNWIND $batch AS item
+            MERGE (d:Document {id: item.id})
+            SET d += item.properties
+            """,
+            
+            # Create Entity nodes and relationships
+            """
+            UNWIND $batch AS item
+            MATCH (d:Document {id: item.id})
+            UNWIND item.entities AS entity
+            MERGE (e:Entity {
+                id: entity.text,
+                type: entity.type
+            })
+            MERGE (d)-[:MENTIONS {
+                confidence: entity.confidence
+            }]->(e)
+            """,
+            
+            # Create Sector nodes and relationships
+            """
+            UNWIND $batch AS item
+            MATCH (d:Document {id: item.id})
+            UNWIND item.sectors AS sector
+            MERGE (s:Sector {name: sector.name})
+            MERGE (d)-[:BELONGS_TO_SECTOR {
+                confidence: sector.confidence
+            }]->(s)
+            WITH d, sector, s
+            MATCH (e:Entity {id: sector.related_entity})
+            MERGE (e)-[:IN_SECTOR]->(s)
+            """,
+            
+            # Create Sentiment nodes and relationships
+            """
+            UNWIND $batch AS item
+            MATCH (d:Document {id: item.id})
+            WHERE item.properties.sentiment IS NOT NULL
+            MERGE (s:Sentiment {
+                level: CASE 
+                    WHEN item.properties.sentiment > 0.5 THEN 'POSITIVE'
+                    WHEN item.properties.sentiment < -0.5 THEN 'NEGATIVE'
+                    ELSE 'NEUTRAL'
+                END
+            })
+            MERGE (d)-[:HAS_SENTIMENT {
+                score: item.properties.sentiment,
+                confidence: item.properties.sentiment_confidence
+            }]->(s)
+            """,
 
-    def create_semantic_relationships(self, analysis_results: List[Dict]):
-        query = """
-        UNWIND $results AS result
-        MATCH (d:Document {id: result.id})
-        SET d.sentiment = result.sentiment,
-            d.entity_count = result.entity_count,
-            d.processed_at = result.processed_at
-        """
-        return self.query(query, parameters={'results': analysis_results})
+            # Create Market Trend nodes and relationships
+            """
+            UNWIND $batch AS item
+            MATCH (d:Document {id: item.id})
+            UNWIND item.trends AS trend
+            MERGE (t:MarketTrend {
+                type: trend.type,
+                direction: trend.direction
+            })
+            MERGE (d)-[:INDICATES_TREND {
+                confidence: trend.confidence,
+                timestamp: timestamp()
+            }]->(t)
+            """
+        ]
+        
+        try:
+            for query in queries:
+                self.query(query, parameters={'batch': batch_data})
+                logger.info(f"Executed query successfully")
+                
+        except Exception as e:
+            logger.error(f"Error in batch creation: {e}")
+            raise
 
 # Connect to Neo4j
 uri = os.getenv("NEO4J_URI", "bolt://neo4j:7687")  # Changed default to neo4j:7687
@@ -148,91 +204,119 @@ group_id = 'my-group'
 
 kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)
 
-def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAnalyzer, rule_engine: MarketRuleEngine, ontology: MarketOntology):
-    if not batch.messages:
-        logger.info("No messages to process in batch")
-        return
-
-    logger.info(f"Processing batch of {len(batch.messages)} messages")
+def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAnalyzer, 
+                 rule_engine: MarketRuleEngine, ontology: MarketOntology):
     batch_data = []
-    analysis_results = []
-
+    
     for message in batch.messages:
         try:
             text = message.value.decode('utf-8')
             doc_id = message.key.decode('utf-8') if message.key else str(message.offset)
             
-            logger.debug(f"Processing message {doc_id}: {text[:100]}...")
-            
-            # Analyze text with validation
             analysis = analyzer.analyze_market_context(text)
-            if not analysis:
-                logger.error(f"Empty analysis result for message {doc_id}")
-                continue
-
-            # Validate required fields
-            required_fields = ['overall_sentiment', 'market_confidence', 'keywords', 'sectors']
-            if not all(field in analysis for field in required_fields):
-                logger.error(f"Missing required fields in analysis: {[f for f in required_fields if f not in analysis]}")
-                continue
             
-            # Store in Neo4j with safe access
-            batch_data.append({
+            # Document node and base properties
+            document_data = {
                 'id': doc_id,
                 'properties': {
                     'text': text,
                     'created_at': datetime.now().isoformat(),
-                    'sentiment': analysis.get('overall_sentiment', 0),
-                    'market_confidence': analysis.get('market_confidence', 0),
-                    'word_count': len(analysis.get('keywords', []))
+                    'sentiment': analysis['overall_sentiment'],
+                    'market_confidence': analysis['market_confidence'],
+                    'word_count': len(analysis['keywords']),
+                    'sentiment_confidence': analysis.get('sentiment_confidence', 0.5)
                 },
-                'keywords': list(analysis.get('sectors', {}).keys())
-            })
-
-            # Process rules with validation
-            try:
-                recommendations = rule_engine.process_analysis(analysis)
-            except Exception as e:
-                logger.error(f"Error processing rules: {e}")
-                recommendations = []
-
-            # Update ontology with confidence threshold
-            for sector, data in analysis.get('sectors', {}).items():
-                if data.get('confidence', 0) > 0.3:
-                    try:
-                        ontology.add_market_knowledge(
-                            "Event", f"Analysis_{doc_id}",
-                            "relatesToSector",
-                            "Sector", sector
-                        )
-                    except Exception as e:
-                        logger.error(f"Error adding sector knowledge: {e}")
-
-            for rec in recommendations:
-                try:
-                    ontology.add_market_knowledge(
-                        "Event", f"Analysis_{doc_id}",
-                        "hasRecommendation",
-                        "Action", rec.get('action', 'unknown')
-                    )
-                except Exception as e:
-                    logger.error(f"Error adding recommendation: {e}")
-
+                'keywords': list(analysis.get('sectors', {}).keys()),
+                'entities': [
+                    {
+                        'text': entity[0],
+                        'type': entity[1],
+                        'confidence': 0.8
+                    } for entity in analysis['entities']
+                ],
+                'sectors': [
+                    {
+                        'name': sector,
+                        'confidence': data['confidence'],
+                        'related_entity': next((e[0] for e in analysis['entities'] if e[1] == 'ORG'), None)
+                    } for sector, data in analysis['sectors'].items()
+                ],
+                'sentiment': {
+                    'score': analysis['overall_sentiment'],
+                    'confidence': analysis.get('sentiment_confidence', 0.5)
+                }
+            }
+            
+            batch_data.append(document_data)
         except Exception as e:
-            logger.error(f"Error processing message {doc_id}: {e}", exc_info=True)
-            continue
+            logger.error(f"Error processing message: {e}", exc_info=True)
 
-    # Batch persist with transaction
     try:
         if batch_data:
             logger.info(f"Persisting {len(batch_data)} records")
-            conn.batch_create_nodes(batch_data)
-            ontology.save_to_neo4j()
+            
+            # Create document nodes
+            conn.query("""
+            UNWIND $batch AS item 
+            MERGE (d:Document {id: item.id})
+            SET d += item.properties
+            """, parameters={'batch': batch_data})
+            
+            # Create entity relationships
+            conn.query("""
+            UNWIND $batch AS item 
+            MATCH (d:Document {id: item.id})
+            UNWIND item.entities AS entity
+            MERGE (e:Entity {
+                id: entity.text,
+                type: entity.type
+            })
+            MERGE (d)-[:MENTIONS {
+                confidence: entity.confidence
+            }]->(e)
+            """, parameters={'batch': batch_data})
+            
+            # Create sector relationships
+            conn.query("""
+            UNWIND $batch AS item 
+            MATCH (d:Document {id: item.id})
+            UNWIND item.sectors AS sector
+            MERGE (s:Sector {name: sector.name})
+            MERGE (d)-[:BELONGS_TO_SECTOR {
+                confidence: sector.confidence
+            }]->(s)
+            WITH d, sector, s
+            MATCH (e:Entity {id: sector.related_entity})
+            MERGE (e)-[:IN_SECTOR]->(s)
+            """, parameters={'batch': batch_data})
+            
+            # Create sentiment relationships
+            conn.query("""
+            UNWIND $batch AS item 
+            MATCH (d:Document {id: item.id})
+            WHERE item.properties.sentiment IS NOT NULL
+            MERGE (s:Sentiment {
+                level: CASE
+                    WHEN item.properties.sentiment > 0.5 THEN 'POSITIVE'
+                    WHEN item.properties.sentiment < -0.5 THEN 'NEGATIVE'
+                    ELSE 'NEUTRAL'
+                END
+            })
+            MERGE (d)-[:HAS_SENTIMENT {
+                score: item.properties.sentiment,
+                confidence: item.sentiment.confidence
+            }]->(s)
+            """, parameters={'batch': batch_data})
+            
             logger.info("Batch successfully persisted")
+            
     except Exception as e:
         logger.error(f"Error persisting batch: {e}", exc_info=True)
 
     batch.clear()
+    
+    
+    
 def main():
     logger.setLevel(logging.INFO)  # Set to DEBUG for more detailed logs
     analyzer = MarketAnalyzer()

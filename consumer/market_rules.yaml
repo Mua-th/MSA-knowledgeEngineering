@@ -1,0 +1,36 @@
+rules:
+  - name: "Strong Positive Sentiment"
+    condition:
+      sentiment_polarity: ">0.8"
+      confidence: ">0.7"
+      market_confidence: ">0.5"
+    actions:
+      - type: "MARKET_SIGNAL"
+        signal: "STRONG_BUY"
+        confidence_multiplier: 1.2
+      - type: "ONTOLOGY_UPDATE"
+        relation: "indicatesMarketTrend"
+        trend: "BULLISH"
+
+  - name: "Negative Sector Trend"
+    condition:
+      sentiment_polarity: "<-0.3"
+      sector_sentiment_count: ">3"
+      timeframe_hours: 24
+    actions:
+      - type: "SECTOR_ALERT"
+        alert_type: "NEGATIVE_TREND"
+        min_confidence: 0.6
+      - type: "ONTOLOGY_UPDATE"
+        relation: "indicatesSectorTrend"
+        trend: "BEARISH"
+
+  - name: "Brand Sentiment Change"
+    condition:
+      sentiment_change: ">0.5"
+      timeframe_hours: 48
+      mention_count: ">10"
+    actions:
+      - type: "BRAND_ALERT"
+        alert_type: "SENTIMENT_SHIFT"
+        notification_priority: "HIGH"

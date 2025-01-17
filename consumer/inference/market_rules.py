@@ -1,6 +1,10 @@
+import yaml
+import logging
 from typing import Dict, List
-import json
 from datetime import datetime, timedelta
+import os
+
+logger = logging.getLogger(__name__)
 
 class MarketRuleEngine:
     def __init__(self):
@@ -8,21 +12,69 @@ class MarketRuleEngine:
         self.historical_data = []
 
     def _load_rules(self) -> List[Dict]:
-        # This would typically load from a configuration file
+        rules_path = os.path.join(os.path.dirname(__file__), '..', 'market_rules.yaml')
+        try:
+            with open(rules_path, 'r') as f:
+                config = yaml.safe_load(f)
+                return config['rules']
+        except Exception as e:
+            logger.error(f"Failed to load rules: {e}")
+            return self._get_default_rules()
+
+    def _get_default_rules(self) -> List[Dict]:
         return [
             {
-                "condition": lambda x: x["sentiment"]["polarity"] < -0.5 and 
-                                     x["market_confidence"] < -0.3,
-                "action": "ALERT_NEGATIVE_TREND",
-                "recommendation": "Consider defensive market position"
-            },
-            {
-                "condition": lambda x: x["sentiment"]["polarity"] > 0.5 and 
-                                     len(x["aspects"]["features"]) > 2,
-                "action": "OPPORTUNITY_DETECTED",
-                "recommendation": "Consider increasing market exposure"
+                "name": "Default Positive",
+                "condition": {
+                    "sentiment_polarity": ">0.5",
+                    "confidence": ">0.6"
+                },
+                "actions": [{
+                    "type": "MARKET_SIGNAL",
+                    "signal": "POSITIVE"
+                }]
             }
         ]
+
+    def _evaluate_condition(self, condition: Dict, analysis: Dict) -> bool:
+        try:
+            # Get values with safe access
+            sentiment = analysis.get('overall_sentiment', 0)  # Changed from nested dict
+            confidence = analysis.get('confidence', 0)
+            market_confidence = analysis.get('market_confidence', 0)
+
+            # Evaluate conditions
+            for key, value in condition.items():
+                if key == 'sentiment_polarity':
+                    if not self._compare_value(sentiment, value):
+                        return False
+                elif key == 'confidence':
+                    if not self._compare_value(confidence, value):
+                        return False
+                elif key == 'market_confidence':
+                    if not self._compare_value(market_confidence, value):
+                        return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Error evaluating condition: {e}")
+            return False
+
+    def _compare_value(self, actual: float, condition: str) -> bool:
+        try:
+            op = condition[0]
+            value = float(condition[1:])
+            
+            if op == '>':
+                return actual > value
+            elif op == '<':
+                return actual < value
+            elif op == '=':
+                return abs(actual - value) < 0.01
+                
+            return False
+        except Exception:
+            return False
 
     def process_analysis(self, analysis_result: Dict) -> List[Dict]:
         recommendations = []
@@ -35,10 +87,9 @@ class MarketRuleEngine:
 
         # Apply rules
         for rule in self.rules:
-            if rule["condition"](analysis_result):
+            if self._evaluate_condition(rule["condition"], analysis_result):
                 recommendations.append({
-                    "action": rule["action"],
-                    "recommendation": rule["recommendation"],
+                    "action": rule["actions"],
                     "confidence": self._calculate_confidence(analysis_result),
                     "timestamp": datetime.now().isoformat()
                 })
@@ -46,17 +97,31 @@ class MarketRuleEngine:
         return recommendations
 
     def _calculate_confidence(self, analysis: Dict) -> float:
-        # Calculate confidence based on historical data and current analysis
-        recent_data = [d for d in self.historical_data 
-                      if datetime.fromisoformat(d["timestamp"]) > 
-                         datetime.now() - timedelta(days=7)]
-        
-        if not recent_data:
+        try:
+            # Calculate confidence based on historical data and current analysis
+            recent_data = [d for d in self.historical_data 
+                          if datetime.fromisoformat(d["timestamp"]) > 
+                             datetime.now() - timedelta(days=7)]
+            
+            if not recent_data:
+                return 0.5
+
+            # Get sentiment directly from overall_sentiment
+            current_sentiment = analysis.get('overall_sentiment', 0)
+            historical_sentiments = [
+                d['analysis'].get('overall_sentiment', 0) 
+                for d in recent_data
+            ]
+            
+            if not historical_sentiments:
+                return 0.6  # Default confidence if no historical data
+                
+            avg_historical = sum(historical_sentiments) / len(historical_sentiments)
+            sentiment_stability = 1 - abs(current_sentiment - avg_historical)
+
+            return min(1.0, sentiment_stability * 0.7 + len(recent_data) / 100 * 0.3)
+            
+        except Exception as e:
+            logger.error(f"Error calculating confidence: {e}")
             return 0.5
 
-        sentiment_stability = 1 - abs(
-            analysis["sentiment"]["polarity"] - 
-            sum(d["analysis"]["sentiment"]["polarity"] for d in recent_data) / len(recent_data)
-        )
-
-        return min(1.0, sentiment_stability * 0.7 + len(recent_data) / 100 * 0.3)
