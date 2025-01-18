@@ -87,36 +87,38 @@ def main():
     producer = create_producer()
     generator = MarketDataGenerator()
     topic = os.getenv("KAFKA_TOPIC", "textdata")
-    batch_size = int(os.getenv("BATCH_SIZE", "100"))
-    interval = float(os.getenv("INTERVAL_SECONDS", "1.0"))
     
-    logger.info(f"Starting automated text data generation: batch_size={batch_size}, interval={interval}s")
+    # Remove batch_size since we're sending one record at a time
+    # Set fixed 5 second interval
+    interval = 5.0
+    
+    logger.info(f"Starting market data generation with {interval}s interval")
     
     try:
         while True:
-            # Generate and send a batch of records
-            records = generator.generate_batch(batch_size)
-            
-            for record in records:
-                try:
-                    # Convert market data to text
-                    text_data = generate_text_from_record(record)
-                    
-                    # Send text data
-                    future = producer.send(topic, value=text_data)
-                    record_metadata = future.get(timeout=10)
-                    logger.info(f"Sent text data for {record['company']} - "
-                              f"Topic: {record_metadata.topic}, "
-                              f"Partition: {record_metadata.partition}, "
-                              f"Offset: {record_metadata.offset}")
-                    logger.info(f"Text: {text_data}")
-                    time.sleep(interval)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to send message: {str(e)}")
-            
-            producer.flush()
-            logger.info(f"Batch complete - {batch_size} records sent")
+            try:
+                # Generate single record
+                record = generator.generate_batch(1)[0]
+                
+                # Convert market data to text
+                text_data = generate_text_from_record(record)
+                
+                # Send text data
+                future = producer.send(topic, value=text_data)
+                record_metadata = future.get(timeout=10)
+                
+                logger.info(f"Sent: {text_data}")
+                logger.info(f"Topic: {record_metadata.topic}, "
+                          f"Partition: {record_metadata.partition}, "
+                          f"Offset: {record_metadata.offset}")
+                
+                # Flush and wait 5 seconds before next message
+                producer.flush()
+                time.sleep(interval)
+                
+            except Exception as e:
+                logger.error(f"Failed to send message: {str(e)}")
+                time.sleep(interval)  # Still wait before retry
 
     except KeyboardInterrupt:
         logger.info("Shutting down producer...")
