@@ -78,21 +78,28 @@ class MarketRuleEngine:
 
     def process_analysis(self, analysis_result: Dict) -> List[Dict]:
         recommendations = []
-        
-        # Store historical data
-        self.historical_data.append({
-            "timestamp": datetime.now().isoformat(),
-            "analysis": analysis_result
-        })
+        try:
+            # Store analysis result in history
+            self.historical_data.append({
+                "timestamp": datetime.now().isoformat(),
+                "analysis": analysis_result
+            })
 
-        # Apply rules
-        for rule in self.rules:
-            if self._evaluate_condition(rule["condition"], analysis_result):
-                recommendations.append({
-                    "action": rule["actions"],
-                    "confidence": self._calculate_confidence(analysis_result),
-                    "timestamp": datetime.now().isoformat()
-                })
+            # Process each rule
+            for rule in self.rules:
+                if self._evaluate_condition(rule["condition"], analysis_result):
+                    # Fix action access - rule["actions"] is a list
+                    action = rule["actions"][0] if isinstance(rule["actions"], list) else rule["actions"]
+                    
+                    recommendations.append({
+                        "action": action["type"] if isinstance(action, dict) else action,
+                        "confidence": self._calculate_confidence(analysis_result),
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+        except Exception as e:
+            logger.error(f"Error processing rules: {e}")
+            return []
 
         return recommendations
 

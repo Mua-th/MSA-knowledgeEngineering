@@ -4,6 +4,9 @@ import time
 import logging
 import sys
 import socket
+import json
+import random
+from market_data_generator import MarketDataGenerator
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +31,6 @@ def create_producer(retries=5, retry_interval=5):
         try:
             producer = KafkaProducer(
                 bootstrap_servers=[bootstrap_servers],
-                key_serializer=str.encode,
                 value_serializer=str.encode,
                 security_protocol="PLAINTEXT",
                 api_version=(2,8,0),
@@ -45,35 +47,76 @@ def create_producer(retries=5, retry_interval=5):
             logger.warning(f"Connection attempt {attempt + 1} failed, retrying in {retry_interval}s...")
             time.sleep(retry_interval)
 
+def generate_text_from_record(record):
+    """Convert market data record to natural text"""
+    templates = [
+        "{company} {event_type} shows {trend} signals with sentiment {sentiment}. Related companies: {related}.",
+        "Market Update: {company} in {sector} sector {event_type}. Sentiment is {sentiment_desc} at {sentiment}.",
+        "Latest from {sector}: {company} announces {event_type}. Market trending {trend} with {sentiment_desc} outlook.",
+        "{event_type} for {company} indicates {sentiment_desc} market response. Volume at {volume}.",
+        "{company} {event_type} impacts {related}. Market sentiment {sentiment_desc} with {trend} indicators."
+    ]
+    
+    # Get sentiment description
+    sentiment_val = record['sentiment']['score']
+    if sentiment_val >= 0.6:
+        sentiment_desc = "very positive"
+    elif sentiment_val >= 0.2:
+        sentiment_desc = "positive"
+    elif sentiment_val >= -0.2:
+        sentiment_desc = "neutral"
+    elif sentiment_val >= -0.6:
+        sentiment_desc = "negative"
+    else:
+        sentiment_desc = "very negative"
+
+    text = random.choice(templates).format(
+        company=record['company'],
+        event_type=record['event_type'].lower(),
+        trend=record['market_indicators']['trend'].lower(),
+        sentiment=round(record['sentiment']['score'], 2),
+        sentiment_desc=sentiment_desc,
+        sector=record['sector'],
+        related=", ".join(record['related_entities']),
+        volume=format(record['market_indicators']['volume'], ",")
+    )
+    
+    return text
+
 def main():
     producer = create_producer()
-    
-    print("Enter messages to send to Kafka. Type 'exit' to quit.")
+    generator = MarketDataGenerator()
     topic = os.getenv("KAFKA_TOPIC", "textdata")
+    batch_size = int(os.getenv("BATCH_SIZE", "100"))
+    interval = float(os.getenv("INTERVAL_SECONDS", "1.0"))
+    
+    logger.info(f"Starting automated text data generation: batch_size={batch_size}, interval={interval}s")
     
     try:
         while True:
-            logger.info("Waiting for user input for key")
-            logger.debug("Prompting user for key input")
-            key = input("Enter key (or 'exit' to quit): ")
-            if key.lower() == 'exit':
-                break
-                
-            logger.info(f"User entered key: {key}")
-            logger.debug("Prompting user for value input")
-            value = input("Enter value: ")
-            if value.lower() == 'exit':
-                break
-
-            logger.info(f"Sending message to topic {topic} with key {key} and value {value}")
-            future = producer.send(topic, key=key, value=value)
-            try:
-                record_metadata = future.get(timeout=10)
-                logger.info(f"Message sent - Topic: {record_metadata.topic}, "
-                          f"Partition: {record_metadata.partition}, "
-                          f"Offset: {record_metadata.offset}")
-            except Exception as e:
-                logger.error(f"Failed to send message: {str(e)}")
+            # Generate and send a batch of records
+            records = generator.generate_batch(batch_size)
+            
+            for record in records:
+                try:
+                    # Convert market data to text
+                    text_data = generate_text_from_record(record)
+                    
+                    # Send text data
+                    future = producer.send(topic, value=text_data)
+                    record_metadata = future.get(timeout=10)
+                    logger.info(f"Sent text data for {record['company']} - "
+                              f"Topic: {record_metadata.topic}, "
+                              f"Partition: {record_metadata.partition}, "
+                              f"Offset: {record_metadata.offset}")
+                    logger.info(f"Text: {text_data}")
+                    time.sleep(interval)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send message: {str(e)}")
+            
+            producer.flush()
+            logger.info(f"Batch complete - {batch_size} records sent")
 
     except KeyboardInterrupt:
         logger.info("Shutting down producer...")

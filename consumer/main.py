@@ -3,6 +3,7 @@ import time
 import logging
 from typing import List, Dict
 from datetime import datetime
+import uuid  # Add this import
 from kafka import KafkaConsumer
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
@@ -76,6 +77,53 @@ class Neo4jConnection:
         with self._driver.session(database=self.database) as session:
             result = session.run(query, parameters)
             return [record for record in result]
+
+    def initialize_schema(self):
+        """Initialize Neo4j constraints and indexes"""
+        constraints = [
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Sector) REQUIRE s.name IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:MarketTrend) REQUIRE t.type IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Sentiment) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Action) REQUIRE a.type IS UNIQUE"
+        ]
+        
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.type)",
+            "CREATE INDEX IF NOT EXISTS FOR (d:Document) ON (d.timestamp)",
+            "CREATE INDEX IF NOT EXISTS FOR (s:Sentiment) ON (s.level)"
+        ]
+        
+        for query in constraints + indexes:
+            self.query(query)
+
+    def validate_graph(self):
+        """Validate graph structure and relationships"""
+        validation_queries = [
+            # Check node counts
+            """
+            MATCH (n) 
+            RETURN labels(n) as type, count(*) as count
+            """,
+            
+            # Check relationship types
+            """
+            MATCH ()-[r]->() 
+            RETURN type(r) as type, count(*) as count
+            """,
+            
+            # Verify entity-sector connections
+            """
+            MATCH (e:Entity)-[r:IN_SECTOR]->(s:Sector)
+            RETURN e.id, s.name, r.confidence
+            """
+        ]
+        
+        results = {}
+        for query in validation_queries:
+            results[query] = self.query(query)
+        return results
 
     def batch_create_nodes(self, batch_data: List[Dict]):
         queries = [
@@ -206,117 +254,167 @@ kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)
 
 def process_batch(batch: MessageBatch, conn: Neo4jConnection, analyzer: MarketAnalyzer, 
                  rule_engine: MarketRuleEngine, ontology: MarketOntology):
-    batch_data = []
+    
+    # Add mappings
+    COMPANY_SECTORS = {
+        'Amazon': 'Technology',
+        'Microsoft': 'Technology',
+        'NVIDIA': 'Technology',
+        'Intel': 'Technology',
+        'Netflix': 'Communications',
+        'AMD': 'Technology',
+        'Apple': 'Technology',
+        'Tesla': 'Automotive',
+        'Google': 'Technology',
+        'Facebook': 'Communications'
+    }
+    
+    ACTION_KEYWORDS = {
+        'launch': 'PRODUCT_LAUNCH',
+        'merger': 'MERGER',
+        'acquisition': 'ACQUISITION',
+        'expansion': 'EXPANSION',
+        'award': 'AWARD',
+        'change': 'MANAGEMENT_CHANGE',
+        'earnings': 'EARNINGS_REPORT',
+        'regulatory': 'REGULATORY_NEWS'
+    }
     
     for message in batch.messages:
         try:
             text = message.value.decode('utf-8')
-            doc_id = message.key.decode('utf-8') if message.key else str(message.offset)
+            doc_id = f"doc_{int(time.time())}_{uuid.uuid4().hex[:8]}"
             
-            analysis = analyzer.analyze_market_context(text)
+            # Extract companies mentioned in text
+            companies = [company for company in COMPANY_SECTORS.keys() 
+                       if company in text]
             
-            # Document node and base properties
-            document_data = {
+            # Calculate simple sentiment
+            positive_words = ['positive', 'very positive', 'bullish']
+            negative_words = ['negative', 'very negative', 'bearish']
+            
+            sentiment_score = 0
+            for word in positive_words:
+                if word in text.lower():
+                    sentiment_score += 0.3
+            for word in negative_words:
+                if word in text.lower():
+                    sentiment_score -= 0.3
+            
+            # Create Document node
+            create_doc_query = """
+            CREATE (d:Document {
+                id: $id,
+                timestamp: $timestamp,
+                text: $text,
+                sentiment_score: $sentiment_score,
+                confidence: $confidence
+            })
+            RETURN d
+            """
+            
+            conn.query(create_doc_query, {
                 'id': doc_id,
-                'properties': {
-                    'text': text,
-                    'created_at': datetime.now().isoformat(),
-                    'sentiment': analysis['overall_sentiment'],
-                    'market_confidence': analysis['market_confidence'],
-                    'word_count': len(analysis['keywords']),
-                    'sentiment_confidence': analysis.get('sentiment_confidence', 0.5)
-                },
-                'keywords': list(analysis.get('sectors', {}).keys()),
-                'entities': [
-                    {
-                        'text': entity[0],
-                        'type': entity[1],
-                        'confidence': 0.8
-                    } for entity in analysis['entities']
-                ],
-                'sectors': [
-                    {
-                        'name': sector,
-                        'confidence': data['confidence'],
-                        'related_entity': next((e[0] for e in analysis['entities'] if e[1] == 'ORG'), None)
-                    } for sector, data in analysis['sectors'].items()
-                ],
-                'sentiment': {
-                    'score': analysis['overall_sentiment'],
-                    'confidence': analysis.get('sentiment_confidence', 0.5)
-                }
-            }
+                'timestamp': datetime.now().isoformat(),
+                'text': text,
+                'sentiment_score': sentiment_score,
+                'confidence': 0.8
+            })
+
+            # Create and link entities and sectors
+            entity_sector_query = """
+            MATCH (d:Document {id: $doc_id})
+            MERGE (e:Entity {name: $entity_name})
+            ON CREATE SET e.type = 'Company'
+            MERGE (s:Sector {name: $sector_name})
             
-            batch_data.append(document_data)
+            MERGE (d)-[m:MENTIONS]->(e)
+            ON CREATE SET m.confidence = $confidence
+            
+            MERGE (e)-[is:IN_SECTOR]->(s)
+            ON CREATE SET is.confidence = $confidence
+            """
+            
+            # Process each company found in text
+            for company in companies:
+                conn.query(entity_sector_query, {
+                    'doc_id': doc_id,
+                    'entity_name': company,
+                    'sector_name': COMPANY_SECTORS[company],
+                    'confidence': 0.8
+                })
+
+            # Create and link sentiment
+            sentiment_query = """
+            MATCH (d:Document {id: $doc_id})
+            CREATE (s:Sentiment {
+                level: $level,
+                score: $score,
+                id: $sentiment_id
+            })
+            CREATE (d)-[r:HAS_SENTIMENT {confidence: $confidence}]->(s)
+            """
+
+            sentiment_level = 'POSITIVE' if sentiment_score > 0.3 else 'NEGATIVE' if sentiment_score < -0.3 else 'NEUTRAL'
+            
+            conn.query(sentiment_query, {
+                'doc_id': doc_id,
+                'level': sentiment_level,
+                'score': sentiment_score,
+                'sentiment_id': f"sentiment_{doc_id}",
+                'confidence': 0.8
+            })
+
+            # Process actions
+            text_lower = text.lower()
+            for keyword, action_type in ACTION_KEYWORDS.items():
+                if keyword in text_lower:
+                    # Find the company performing the action
+                    for company in companies:
+                        if company.lower() in text_lower:
+                            conn.query("""
+                            MATCH (d:Document {id: $doc_id})
+                            MERGE (a:Action {type: $action_type})
+                            CREATE (d)-[r:HAS_ACTION {
+                                confidence: $confidence,
+                                timestamp: datetime()
+                            }]->(a)
+                            WITH d, a
+                            MATCH (e:Entity {name: $entity_name})
+                            CREATE (e)-[p:PERFORMS {
+                                timestamp: datetime(),
+                                confidence: $confidence
+                            }]->(a)
+                            """, {
+                                'doc_id': doc_id,
+                                'action_type': action_type,
+                                'confidence': 0.8,
+                                'entity_name': company
+                            })
+                            
+                            # Create impact relationships
+                            impacted_companies = [c for c in companies if c != company]
+                            if impacted_companies:
+                                for impacted in impacted_companies:
+                                    conn.query("""
+                                    MATCH (a:Action {type: $action_type})
+                                    MATCH (e:Entity {name: $target_entity})
+                                    MERGE (a)-[i:IMPACTS {
+                                        confidence: $confidence,
+                                        timestamp: datetime()
+                                    }]->(e)
+                                    """, {
+                                        'action_type': action_type,
+                                        'target_entity': impacted,
+                                        'confidence': 0.7
+                                    })
+
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
-
-    try:
-        if batch_data:
-            logger.info(f"Persisting {len(batch_data)} records")
-            
-            # Create document nodes
-            conn.query("""
-            UNWIND $batch AS item 
-            MERGE (d:Document {id: item.id})
-            SET d += item.properties
-            """, parameters={'batch': batch_data})
-            
-            # Create entity relationships
-            conn.query("""
-            UNWIND $batch AS item 
-            MATCH (d:Document {id: item.id})
-            UNWIND item.entities AS entity
-            MERGE (e:Entity {
-                id: entity.text,
-                type: entity.type
-            })
-            MERGE (d)-[:MENTIONS {
-                confidence: entity.confidence
-            }]->(e)
-            """, parameters={'batch': batch_data})
-            
-            # Create sector relationships
-            conn.query("""
-            UNWIND $batch AS item 
-            MATCH (d:Document {id: item.id})
-            UNWIND item.sectors AS sector
-            MERGE (s:Sector {name: sector.name})
-            MERGE (d)-[:BELONGS_TO_SECTOR {
-                confidence: sector.confidence
-            }]->(s)
-            WITH d, sector, s
-            MATCH (e:Entity {id: sector.related_entity})
-            MERGE (e)-[:IN_SECTOR]->(s)
-            """, parameters={'batch': batch_data})
-            
-            # Create sentiment relationships
-            conn.query("""
-            UNWIND $batch AS item 
-            MATCH (d:Document {id: item.id})
-            WHERE item.properties.sentiment IS NOT NULL
-            MERGE (s:Sentiment {
-                level: CASE
-                    WHEN item.properties.sentiment > 0.5 THEN 'POSITIVE'
-                    WHEN item.properties.sentiment < -0.5 THEN 'NEGATIVE'
-                    ELSE 'NEUTRAL'
-                END
-            })
-            MERGE (d)-[:HAS_SENTIMENT {
-                score: item.properties.sentiment,
-                confidence: item.sentiment.confidence
-            }]->(s)
-            """, parameters={'batch': batch_data})
-            
-            logger.info("Batch successfully persisted")
-            
-    except Exception as e:
-        logger.error(f"Error persisting batch: {e}", exc_info=True)
+            continue
 
     batch.clear()
-    
-    
-    
+
 def main():
     logger.setLevel(logging.INFO)  # Set to DEBUG for more detailed logs
     analyzer = MarketAnalyzer()
@@ -325,6 +423,9 @@ def main():
     batch = MessageBatch(max_size=3)  # Process one message at a time for testing
     
     kafka_conn = KafkaConnection(bootstrap_servers, topic, group_id)
+    
+    # Initialize Neo4j schema
+    conn.initialize_schema()
     
     try:
         logger.info("Starting message consumption...")
